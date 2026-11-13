@@ -19,6 +19,10 @@ de la izquierda es el cazador y los demás son los fantasmas) en .vscode/imagene
 este archivo. En la barra, el cazador se come a los fantasmas conforme avanza la carga.
 (También sirven "cazador.png" y "presa.png" sueltos.) Sin ellos se usan los personajes
 dibujados por código.
+Opcional: "cazador_cerrado.png" (el cazador con la boca cerrada) para que abra y cierre la
+boca; si no existe, el cazador "mastica" estirando y comprimiendo el sprite.
+Al acercarse el cazador, cada fantasma se asusta (azul, parpadea y trata de huir); al
+alcanzarlo se lo traga, con onda expansiva, puntos, notas y un sonido.
 
 Teclas: M = silenciar / activar música, ESC = salir.
 
@@ -37,7 +41,7 @@ Notas
     generar sonidos o calcular datos está bien. Evita crear la ventana o llamar
     a .convert() / .convert_alpha() dentro de ellas (hazlo antes o después).
   * La música usa el mismo formato de mixer que sonido.py (44100 Hz, 16 bits,
-    estéreo), así que no interfiere con el audio del juego.
+    estéreo), así que no interfiere con el audio de tu juego.
 """
 import array
 import math
@@ -282,6 +286,7 @@ class Musica:
         self.sonando = False
         self.silencio = False
         self.sonido = None
+        self._sfx = {}
         self.archivo = next((m for m in MUSICAS if os.path.exists(m)), None)
         try:
             if not pygame.mixer.get_init():
@@ -327,6 +332,31 @@ class Musica:
         except pygame.error as e:
             print("[carga] No se pudo reproducir:", e)
             self.disponible = False
+
+    def efecto_comer(self, i):
+        """Sonido corto ascendente al comerse un fantasma (cada uno suena más agudo)."""
+        if not self.disponible or self.silencio or not pygame.mixer.get_init():
+            return
+        try:
+            snd = self._sfx.get(i)
+            if snd is None:
+                freq, fmt, canales = pygame.mixer.get_init()
+                if fmt != -16:
+                    return
+                n = int(0.3 * freq)
+                f0 = 200 * 1.12 ** i
+                buf = array.array("h")
+                fase = 0.0
+                for k in range(n):
+                    p = k / n
+                    fase += f0 * (1 + 3.5 * p ** 0.7) / freq
+                    v = (1.0 if fase % 1.0 < 0.5 else -1.0) * (1 - p) ** 1.5 * min(1.0, k / 80) * 9000
+                    buf.extend([int(v)] * canales)
+                snd = self._sfx[i] = pygame.mixer.Sound(buffer=buf.tobytes())
+                snd.set_volume(0.5)
+            snd.play()
+        except pygame.error:
+            pass
 
     def alternar_silencio(self):
         self.silencio = not self.silencio
@@ -434,7 +464,16 @@ class PantallaCarga:
 
         # personajes propios para la barra (personajes.png, o cazador.png / presa.png)
         self.spr_cazador, self.fantasmas = self._cargar_personajes(int(self.bh * 0.72))
+        self.spr_cerrado = (self._cargar_sprite("cazador_cerrado", self.spr_cazador.get_height())
+                            if self.spr_cazador else None)     # opcional: cuadro con la boca cerrada
+        # versiones "asustadas" de los fantasmas (azul y blanco, para parpadear antes de ser comidos)
+        self.fant_azul = [self._asustado(s, (40, 60, 235)) for s in self.fantasmas]
+        self.fant_blanco = [self._asustado(s, (235, 235, 255)) for s in self.fantasmas]
         self.comidos = set()
+        self.tragando = []       # fantasmas siendo tragados: [indice, x, y, edad]
+        self.anillos = []        # ondas expansivas: [edad]
+        self.t_comio = 99.0      # segundos desde el último fantasma comido
+        self.musica = None
         self.popups = []
         self.consejos = random.sample(CONSEJOS, len(CONSEJOS))
 
@@ -487,8 +526,22 @@ class PantallaCarga:
         presa = self._cargar_sprite("presa", int(alto * 0.85))
         return self._cargar_sprite("cazador", alto), ([presa] if presa else [])
 
+    @staticmethod
+    def _asustado(spr, color):
+        """Silueta de color sólido con el detalle original apenas visible."""
+        sil = pygame.mask.from_surface(spr, 40).to_surface(setcolor=(*color, 255), unsetcolor=(0, 0, 0, 0))
+        detalle = spr.copy()
+        detalle.set_alpha(90)
+        sil.blit(detalle, (0, 0))
+        return sil
+
     def _comer(self, x, y, i):
-        """Efecto al comerse un fantasma: puntos que suben y notas que salen disparadas."""
+        """Se come un fantasma: lo traga, onda expansiva, puntos, notas y sonido."""
+        self.tragando.append([i, x, y, 0.0])
+        self.anillos.append([0.0])
+        self.t_comio = 0.0
+        if self.musica:
+            self.musica.efecto_comer(i)
         self.popups.append([x, self.by - 16 * self.u, 0.0, str(200 * 2 ** i)])
         for _ in range(10):
             ang, vel = random.uniform(0, 6.28), random.uniform(80, 260) * self.u
@@ -511,6 +564,10 @@ class PantallaCarga:
             if os.path.exists(ruta):
                 try:
                     img = pygame.image.load(ruta).convert_alpha()
+                    rects = [c.get_bounding_rects()[0]
+                             for c in pygame.mask.from_surface(img, 40).connected_components(20)]
+                    if rects:                                   # recorta los márgenes transparentes
+                        img = img.subsurface(rects[0].unionall(rects[1:])).copy()
                     esc = alto / img.get_height()
                     return pygame.transform.smoothscale(img, (max(1, int(img.get_width() * esc)), alto))
                 except pygame.error as e:
@@ -656,8 +713,15 @@ class PantallaCarga:
                              (int(i * paso + (paso - bw) / 2), self.eq_alto - h, bw, h), border_radius=bw // 2)
         self.screen.blit(self.eq, (0, self.H - self.eq_alto))
 
-    def _dibujar_barra(self, prog, t, pulso):
+    def _dibujar_barra(self, prog, t, pulso, dt=0.0):
         scr, bx, by, bw, bh, u = self.screen, self.bx, self.by, self.bw, self.bh, self.u
+        for tr in self.tragando:
+            tr[3] += dt
+        for an in self.anillos:
+            an[0] += dt
+        self.tragando = [tr for tr in self.tragando if tr[3] < 0.35]
+        self.anillos = [an for an in self.anillos if an[0] < 0.5]
+        self.t_comio += dt
         pista = pygame.Rect(bx, by, bw, bh)
         pygame.draw.rect(scr, (16, 14, 44), pista, border_radius=bh // 2)
         relleno = int(bw * prog)
@@ -691,21 +755,49 @@ class PantallaCarga:
             for i, spr in enumerate(self.fantasmas):
                 if i in self.comidos:
                     continue
-                gx = bx + int(bw * (i + 1) / (n + 1))
+                gx0 = bx + int(bw * (i + 1) / (n + 1))
+                # miedo: 0 = cazador lejos, 1 = encima. Al acercarse el fantasma se asusta,
+                # se pone azul, parpadea, tiembla y trata de huir hacia la derecha.
+                miedo = max(0.0, min(1.0, (5 * r - (gx0 - cx)) / (5 * r)))
+                gx = gx0 + int(1.4 * r * miedo)
+                gy = cy + int(math.sin(t * (9 + 14 * miedo) + i * 1.7) * (4 + 4 * miedo) * u)
                 if cx + r * 1.1 >= gx:
                     self.comidos.add(i)
-                    self._comer(gx, cy, i)
+                    self._comer(max(gx, cx + int(r * 1.2)), gy, i)   # el trago empieza frente a la boca
                     continue
-                gy = cy + int(math.sin(t * 9 + i * 1.7) * 4 * u)
+                if miedo > 0.05:
+                    parpadeo = miedo > 0.7 and int(t * 10) % 2 == 0
+                    spr = (self.fant_blanco if parpadeo else self.fant_azul)[i]
                 scr.blit(spr, spr.get_rect(center=(gx, gy)))
         elif prog < 0.93:
             dibujar_presa(scr, int(cx + r * 4.2), int(cy + math.sin(t * 8) * 3 * u), t, int(r * 0.78))
+        # fantasmas siendo tragados: giran y se encogen hacia la boca
+        ancho_c = self.spr_cazador.get_width() if self.spr_cazador else 2 * r
+        boca = (cx + int(ancho_c * 0.22), cy)
+        for i, x0, y0, edad in self.tragando:
+            p = min(1.0, edad / 0.35)
+            e = p * p
+            base = self.fant_blanco[i] if p > 0.5 else self.fant_azul[i]
+            img = pygame.transform.rotozoom(base, 540 * p, max(0.05, 1 - 0.9 * p))
+            scr.blit(img, img.get_rect(center=(int(x0 + (boca[0] - x0) * e), int(y0 + (boca[1] - y0) * e))))
+        # onda expansiva al comer
+        for (edad,) in self.anillos:
+            e = edad / 0.5
+            rad = int(r * (0.8 + 3.2 * e))
+            col = tuple(int(c * (1 - e)) for c in AMARILLO)
+            anillo = pygame.Surface((2 * rad + 8, 2 * rad + 8))
+            pygame.draw.circle(anillo, col, (rad + 4, rad + 4), rad, max(2, int(5 * u * (1 - e))))
+            scr.blit(anillo, anillo.get_rect(center=boca), special_flags=pygame.BLEND_ADD)
         scr.blit(self.glow, self.glow.get_rect(center=(cx, cy)), special_flags=pygame.BLEND_ADD)
         if self.spr_cazador:
-            # "mastica" estirando y comprimiendo el sprite
-            k = 0.5 + 0.5 * math.sin(t * 10)
-            w, h = self.spr_cazador.get_size()
-            s = pygame.transform.smoothscale(self.spr_cazador, (int(w * (1 + 0.06 * k)), int(h * (1 - 0.08 * k))))
+            trago = max(0.0, 1 - self.t_comio / 0.28)           # se "infla" al tragar
+            if self.spr_cerrado:                                  # boca abierta / cerrada
+                base, k = (self.spr_cerrado if int(t * 8) % 2 else self.spr_cazador), 0.0
+            else:                                                 # sin cuadro cerrado: estira y comprime
+                base, k = self.spr_cazador, 0.5 + 0.5 * math.sin(t * 10)
+            w, h = base.get_size()
+            s = pygame.transform.smoothscale(base, (int(w * (1 + 0.06 * k + 0.22 * trago)),
+                                                    int(h * (1 - 0.08 * k + 0.22 * trago))))
             scr.blit(s, s.get_rect(center=(cx, cy)))
         else:
             dibujar_robot(scr, cx, cy, t, r)
@@ -721,7 +813,7 @@ class PantallaCarga:
         reloj = pygame.time.Clock()
         cargador = Cargador(self.tareas)
         cargador.start()
-        musica = Musica()
+        musica = self.musica = Musica()
         total = max(1, len(self.tareas))
         inicio = time.perf_counter()
         mostrado, hechas_prev, t_tarea = 0.0, 0, inicio
@@ -780,7 +872,7 @@ class PantallaCarga:
             scr.blit(self.vineta, (0, 0))
             scr.blit(self.sombra, (0, H - self.sombra.get_height()))
             self._dibujar_eq(t, pulso)
-            self._dibujar_barra(mostrado, t, pulso)
+            self._dibujar_barra(mostrado, t, pulso, dt)
             self._dibujar_popups(dt)
 
             estado = "¡LISTO!" if t_listo else cargador.actual
